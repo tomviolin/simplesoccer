@@ -1,0 +1,20 @@
+{
+  "name": "planck",
+  "version": "1.6.0",
+  "description": "Local build of Planck.js 1.6.0 (core + testbed) used by the 8-ball example.",
+  "license": "MIT",
+  "type": "commonjs",
+  "module": "dist/planck.mjs",
+  "main": "dist/planck.mjs",
+  "types": "dist/planck.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/planck.d.ts",
+      "import": "./dist/planck.mjs"
+    },
+    "./testbed": {
+      "types": "./dist/testbed.d.ts",
+      "import": "./dist/testbed.mjs"
+    }
+  }
+}
