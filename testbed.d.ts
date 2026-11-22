@@ -158,6 +158,17 @@ interface TestbedContext {
     }>;
     /** left/right/up/down (arrows or WASD), fire (space or enter), and characters */
     activeKeys: ActiveKeys;
+    /** 2D overlay canvas context, when mounted */
+    textOverlay: HostValue<CanvasRenderingContext2D | undefined>;
+    /** world-to-screen transform, in CSS pixels */
+    worldMatrix: {
+        a: number;
+        b: number;
+        c: number;
+        d: number;
+        e: number;
+        f: number;
+    };
 }
 /** Instanced GL drawing for circles, capsules, and polygons. */
 declare class GLDraw extends Middleware<TestbedContext> {

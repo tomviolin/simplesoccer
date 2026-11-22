@@ -20,6 +20,14 @@ const PADDLE_SPEED = 2.0;
 const PADDLE_HIGHSPEED = 4.0;
 // Initial cue ball speed in world units per second.
 const CUE_SPEED = 2.0;
+// A moving ball never slows below this speed, in world units per second.
+const MIN_BALL_SPEED = 0.1;
+// Speeds above HIGH_SPEED_LIMIT decay back toward the limit. The time constant
+// controls how many seconds that takes.
+const HIGH_SPEED_LIMIT = 5.0;
+const HIGH_SPEED_DECAY_TAU = 0.6;
+// Match length shown on the scoreboard.
+const MATCH_SECONDS = 30; //1 * 60;
 
 // Horizontal kick/spring tuning for the paddles.
 // Force applied toward the table center while a kick key is held.
@@ -72,6 +80,15 @@ class EightBallState {
   balls: BallData[] = [];
   rails: RailData[] = [];
   pockets: PocketData[] = [];
+  // scoreboard
+  score = {
+    blue: 0,
+    red: 0,
+    elapsed: 0,
+    pauseSeconds: 0,
+    started: false,
+    ended: false,
+  };
 }
 
 interface EightBallContext extends TestbedContext {
@@ -193,11 +210,12 @@ class PitchLines extends Middleware<EightBallContext> {
     addArc(leftSpotX, 0, arcR, arcR, -theta, theta, 24);
     addArc(rightSpotX, 0, arcR, arcR, Math.PI - theta, Math.PI + theta, 24);
 
-    // Corner arcs, 1 m radius.
-    addArc(left, top, rs, rs, -Math.PI / 2, 0, 8);
-    addArc(right, top, rs, rs, Math.PI, Math.PI * 1.5, 8);
-    addArc(left, bottom, rs, rs, 0, Math.PI / 2, 8);
-    addArc(right, bottom, rs, rs, Math.PI / 2, Math.PI, 8);
+    // Corner arcs, 3 m radius.
+    const cornerRadius = 3 * rs;
+    addArc(left, top, cornerRadius, cornerRadius, -Math.PI / 2, 0, 16);
+    addArc(right, top, cornerRadius, cornerRadius, Math.PI, Math.PI * 1.5, 16);
+    addArc(left, bottom, cornerRadius, cornerRadius, 0, Math.PI / 2, 16);
+    addArc(right, bottom, cornerRadius, cornerRadius, Math.PI / 2, Math.PI, 16);
 
     this.spotRadius = Math.max(0.008, Math.min(width, height) * 0.006);
     this.lastWidth = width;
@@ -291,6 +309,157 @@ class SoundManager {
   }
 }
 
+function formatClock(seconds: number) {
+  const clamped = Math.max(0, seconds);
+  return `${Math.floor(clamped / 60)}:${String(
+    Math.floor(clamped % 60),
+  ).padStart(2, "0")}`;
+}
+
+// FIFA-style scoreboard drawn in the top green rail, upper left.
+class Scoreboard extends Middleware<EightBallContext> {
+  constructor() {
+    super();
+    this.on("frame-update", this.handleFrameUpdate);
+  }
+
+  handleFrameUpdate = () => {
+    const ctx = this.context.textOverlay.value;
+    if (!ctx) return;
+
+    const { game } = this.context;
+    const rail =
+      game.table.railThickness *
+      Math.hypot(this.context.worldMatrix.a, this.context.worldMatrix.b);
+    if (!(rail > 0)) return;
+
+    const font = rail * 0.46;
+    const pad = rail * 0.2;
+    const barHeight = rail - pad;
+    const y = (rail - barHeight) / 2;
+    const x = rail + pad;
+    const gap = font * 0.45;
+    const chip = font * 0.7;
+
+    const blueText = "BLUE";
+    const redText = "RED";
+    const scoreText = `${game.score.blue} - ${game.score.red}`;
+    const clockText = formatClock(game.score.elapsed);
+    const addedMinutes = Math.ceil(game.score.pauseSeconds / 60);
+    const added =
+      game.score.elapsed >= MATCH_SECONDS && addedMinutes > 0
+        ? `+${addedMinutes}`
+        : "";
+
+    ctx.save();
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+
+    ctx.font = `${font}px monospace`;
+    const blueW = ctx.measureText(blueText).width;
+    const redW = ctx.measureText(redText).width;
+    const addedW = added ? ctx.measureText(added).width : 0;
+    ctx.font = `bold ${font}px monospace`;
+    const scoreW = ctx.measureText(scoreText).width;
+    const clockW = ctx.measureText(clockText).width;
+
+    const total =
+      pad + chip + gap + blueW + gap + scoreW + gap + redW + gap + chip +
+      pad + clockW + (added ? gap + addedW : 0);
+
+    ctx.fillStyle = "rgba(0, 0, 0, 0.55)";
+    ctx.fillRect(x, y, total, barHeight);
+
+    const cy = y + barHeight / 2;
+    const chipH = barHeight * 0.62;
+    let cx = x + pad;
+
+    ctx.fillStyle = "#8fd3ff";
+    ctx.fillRect(cx, cy - chipH / 2, chip, chipH);
+    cx += chip + gap;
+
+    ctx.font = `${font}px monospace`;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(blueText, cx, cy);
+    cx += blueW + gap;
+
+    ctx.font = `bold ${font}px monospace`;
+    ctx.fillText(scoreText, cx, cy);
+    cx += scoreW + gap;
+
+    ctx.font = `${font}px monospace`;
+    ctx.fillText(redText, cx, cy);
+    cx += redW + gap;
+
+    ctx.fillStyle = "#ffb3d1";
+    ctx.fillRect(cx, cy - chipH / 2, chip, chipH);
+    cx += chip + pad;
+
+    ctx.fillStyle = "#ffffff";
+    ctx.font = `bold ${font}px monospace`;
+    ctx.fillText(clockText, cx, cy);
+
+    if (added) {
+      cx += clockW + gap;
+      ctx.fillStyle = "#ffd75e";
+      ctx.fillText(added, cx, cy);
+    }
+
+    ctx.restore();
+  };
+}
+
+// Blocks the game behind a match-over panel once full time is reached.
+class MatchOver extends Middleware<EightBallContext> {
+  constructor() {
+    super();
+    this.on("frame-update", this.handleFrameUpdate);
+  }
+
+  handleFrameUpdate = () => {
+    const ctx = this.context.textOverlay.value;
+    if (!ctx) return;
+
+    const ended = this.context.game.score.ended;
+    ctx.canvas.style.pointerEvents = ended ? "auto" : "none";
+    if (!ended) return;
+
+    const w = ctx.canvas.clientWidth || window.innerWidth;
+    const h = ctx.canvas.clientHeight || window.innerHeight;
+    const boxW = Math.min(w * 0.75, 760);
+    const boxH = Math.min(h * 0.32, 260);
+    const bx = (w - boxW) / 2;
+    const by = (h - boxH) / 2;
+
+    ctx.save();
+    // Dim the frozen match.
+    ctx.fillStyle = "rgba(0, 0, 0, 0.55)";
+    ctx.fillRect(0, 0, w, h);
+
+    // Large match-over panel.
+    ctx.fillStyle = "rgba(12, 24, 16, 0.96)";
+    ctx.fillRect(bx, by, boxW, boxH);
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = Math.max(2, Math.min(w, h) * 0.003);
+    ctx.strokeRect(bx, by, boxW, boxH);
+
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    const titleSize = Math.min(boxW * 0.12, boxH * 0.38);
+    ctx.font = `bold ${titleSize}px monospace`;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText("MATCH OVER", w / 2, by + boxH * 0.4);
+
+    const subSize = Math.max(10, titleSize * 0.36);
+    ctx.font = `${subSize}px monospace`;
+    ctx.fillStyle = "#d8e6d8";
+    ctx.fillText("Press R to restart the game", w / 2, by + boxH * 0.72);
+
+    ctx.restore();
+  };
+}
+
 class EightBallGame extends Middleware<EightBallContext> {
   billiardPhysics = new BilliardPhysics();
   sounds = new SoundManager();
@@ -302,20 +471,43 @@ class EightBallGame extends Middleware<EightBallContext> {
     this.use(this.billiardPhysics);
     this.use(new PitchLines());
     this.use(new EightBallTestbed());
+    this.use(new Scoreboard());
+    this.use(new MatchOver());
 
     this.on("activate", this.handleActivate);
     this.on("ball-in-pocket", this.onBallInPocket);
     this.on("sound", (name: string) => this.sounds.play(name));
+    this.on("frame-update", this.handleClock);
     window.addEventListener("keydown", (e) => {
       // Unlock audio on the first user gesture.
       this.sounds.resume();
+
+      // Once the match is over, only R does anything.
+      if (this.context.game.score.ended) {
+	e.preventDefault();
+	e.stopImmediatePropagation();
+	if (e.code === "KeyR") {
+	  this.handleActivate();
+	}
+	return;
+      }
 
       // Space toggles pause. Ignore auto-repeat so holding the key doesn't
       // flicker between paused and running.
       if (e.code === "Space") {
 	e.preventDefault();
 	if (!e.repeat) {
-	  this.context.paused.value = !this.context.paused.value;
+	  const score = this.context.game.score;
+	  if (!score.started) {
+	    // First Space: kick off the match.
+	    score.started = true;
+	    this.context.paused.value = false;
+	    this.sounds.play("matchstart");
+	  } else {
+	    const resuming = this.context.paused.value;
+	    this.context.paused.value = !resuming;
+	    this.sounds.play(resuming ? "stoppage_end" : "stoppage_start");
+	  }
 	}
 	return;
       }
@@ -441,10 +633,61 @@ class EightBallGame extends Middleware<EightBallContext> {
     this.billiardPhysics.setPaddleSpeed("paddle-1", this.rightPaddleSpeed());
   }
 
+  // Advance the match clock. It keeps running while paused; pause time is
+  // accumulated separately and shown as added time at full time.
+  handleClock = (ev: { dt: number }) => {
+    const score = this.context.game.score;
+    if (!score.started) {
+      // Kickoff: hold everything frozen until Space starts the match.
+      if (!this.context.paused.value) this.context.paused.value = true;
+      return;
+    }
+    if (score.ended) return;
+
+    const dt = Math.min(ev.dt / 1000, 0.1);
+
+    if (score.elapsed < MATCH_SECONDS) {
+      const before = score.elapsed;
+      score.elapsed = Math.min(MATCH_SECONDS, before + dt);
+      if (this.context.paused.value) {
+	// Pause time counts only during regulation. If this frame crosses
+	// 5:00, count only the part that occurred before the whistle.
+	score.pauseSeconds += score.elapsed - before;
+      }
+    } else {
+      // During stoppage, pauses are ignored and add no further time.
+      const addedMinutes = Math.ceil(score.pauseSeconds / 60);
+      const end = MATCH_SECONDS + addedMinutes * 60;
+      if (score.elapsed < end) {
+	score.elapsed = Math.min(end, score.elapsed + dt);
+      }
+    }
+
+    const addedMinutes = Math.ceil(score.pauseSeconds / 60);
+    const end = MATCH_SECONDS + addedMinutes * 60;
+    if (score.elapsed >= end) {
+      score.elapsed = end;
+      score.ended = true;
+      this.sounds.play("matchend");
+      // Freeze the match at full time.
+      this.context.paused.value = true;
+    }
+  };
+
   // start a new game
   handleActivate() {
     console.log("Starting new game");
     const { game } = this.context;
+    game.score.blue = 0;
+    game.score.red = 0;
+    game.score.elapsed = 0;
+    game.score.pauseSeconds = 0;
+    game.score.started = false;
+    game.score.ended = false;
+    // Kickoff: wait for Space before anything moves.
+    this.context.paused.value = true;
+    this.billiardPhysics.clearPaddleInput();
+
     const aspect = window.innerHeight > 0
       ? window.innerWidth / window.innerHeight
       : 2;
@@ -461,6 +704,14 @@ class EightBallGame extends Middleware<EightBallContext> {
 
   // sink event listener
   onBallInPocket({ ball, pocket }: { ball: BallData; pocket: PocketData }) {
+    const score = this.context.game.score;
+    // Left pocket is the BLUE team's goal, so RED scores there, and vice versa.
+    if (pocket.key === "pocket-1") {
+      score.red += 1;
+    } else if (pocket.key === "pocket-2") {
+      score.blue += 1;
+    }
+
     const index = this.context.game.balls.indexOf(ball);
     if (index !== -1) {
 	    //setTimeout(() => {this.context.game.balls.splice(index, 1)},250);
@@ -574,6 +825,7 @@ class BilliardPhysics extends Middleware<EightBallContext> {
     // Run the horizontal spring-damper once per physics step, using the same
     // fixed timestep as the world so the motion is frame-rate independent.
     this.on("step-physics", this.handleStep);
+    this.on("step-after", this.handleStepAfter);
   }
 
   // Tracks which direction keys are held for each paddle. `last` is the most
@@ -600,6 +852,24 @@ class BilliardPhysics extends Middleware<EightBallContext> {
   // Reused manifold for classifying a rail hit as horizontal or vertical.
   soundManifold = new WorldManifold();
 
+  // A ball that has just been struck above the speed limit by a paddle keeps
+  // that speed until it rebounds off a rail. These sets are cleared each step.
+  boostedBalls = new WeakSet<Body>();
+  paddleHitsThisStep = new Set<Body>();
+  railHitsThisStep = new Set<Body>();
+
+
+  // Keep a reference so the minimum-speed handler can look up each ball body.
+  ballDriver = Driver.create<BallData, Body>({
+    filter: (data) => data.type === "ball",
+    enter: (data) => {
+      return this.createBall(data);
+    },
+    update: (data, body) => {},
+    exit: (data, body) => {
+      this.context.world.value.destroyBody(body);
+    },
+  });
 
   // Keep a reference so we can look up a paddle's physics body by key.
   railDriver = Driver.create<RailData, Body>({
@@ -618,16 +888,7 @@ class BilliardPhysics extends Middleware<EightBallContext> {
   binder = Binder.create<UserData>({
     key: (data) => data.key,
     drivers: [
-      Driver.create<BallData, Body>({
-        filter: (data) => data.type === "ball",
-        enter: (data) => {
-          return this.createBall(data);
-        },
-        update: (data, body) => {},
-        exit: (data, body) => {
-          this.context.world.value.destroyBody(body);
-        },
-      }),
+      this.ballDriver,
       this.railDriver,
       Driver.create<PocketData, Body>({
         filter: (data) => data.type === "pocket",
@@ -740,6 +1001,63 @@ class BilliardPhysics extends Middleware<EightBallContext> {
     // Left paddle kicks right (+x), right paddle kicks left (-x).
     this.updatePaddleSpring("paddle-0", 1, ev.timeStep);
     this.updatePaddleSpring("paddle-1", -1, ev.timeStep);
+  };
+
+  // Enforce the speed limits: speeds above the high-speed limit decay back
+  // toward it, and moving balls never drop below the minimum. Balls already
+  // at rest stay at rest, so a freshly racked set is not set in motion.
+  handleStepAfter = (ev: { timeStep: number }) => {
+    const { game } = this.context;
+    const dt = ev.timeStep;
+
+    for (let i = 0; i < game.balls.length; i++) {
+      const data = game.balls[i];
+      const body = this.ballDriver.ref(data.key);
+      if (!body) continue;
+
+      const velocity = body.getLinearVelocity();
+      const speed = Math.hypot(velocity.x, velocity.y);
+
+      const paddleHit = this.paddleHitsThisStep.has(body);
+      const railHit = this.railHitsThisStep.has(body);
+
+      if (paddleHit && speed > HIGH_SPEED_LIMIT) {
+	// A fast paddle strike is allowed to keep its speed until a rebound.
+	this.boostedBalls.add(body);
+      } else if (paddleHit || railHit || speed <= HIGH_SPEED_LIMIT) {
+	// At or below the limit there is nothing to delay; a rail rebound also
+	// ends the paddle-boost window.
+	this.boostedBalls.delete(body);
+      }
+
+      // The high-speed decay only applies above the limit, and never to a
+      // paddle strike that is still in flight.
+      if (speed > HIGH_SPEED_LIMIT && !this.boostedBalls.has(body)) {
+	const decayed =
+	  HIGH_SPEED_LIMIT +
+	  (speed - HIGH_SPEED_LIMIT) *
+	    Math.exp(-dt / HIGH_SPEED_DECAY_TAU);
+	const target =
+	  decayed <= HIGH_SPEED_LIMIT + 0.01 ? HIGH_SPEED_LIMIT : decayed;
+	const scale = target / speed;
+	body.setLinearVelocity({
+	  x: velocity.x * scale,
+	  y: velocity.y * scale,
+	});
+      }
+
+      // Independent of the decay: moving balls never drop below the minimum.
+      if (speed > 0 && speed < MIN_BALL_SPEED) {
+	const scale = MIN_BALL_SPEED / speed;
+	body.setLinearVelocity({
+	  x: velocity.x * scale,
+	  y: velocity.y * scale,
+	});
+      }
+    }
+
+    this.paddleHitsThisStep.clear();
+    this.railHitsThisStep.clear();
   };
 
   // A paddle sits at x = 0. While kicked it feels a constant force toward the
@@ -897,10 +1215,13 @@ class BilliardPhysics extends Middleware<EightBallContext> {
 
       const railKey = (rail.getUserData() as RailData).key;
       if (railKey === "paddle-0") {
+	this.paddleHitsThisStep.add(ball);
 	this.emit("sound", "lpaddle");
       } else if (railKey === "paddle-1") {
+	this.paddleHitsThisStep.add(ball);
 	this.emit("sound", "rpaddle");
       } else {
+	this.railHitsThisStep.add(ball);
 	const manifold = contact.getWorldManifold(this.soundManifold);
 	if (manifold && manifold.pointCount > 0) {
 	  const horizontal =
